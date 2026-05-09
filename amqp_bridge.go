@@ -3,15 +3,12 @@ package eventbus
 import (
 	"context"
 
-	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/kcersing/amqpclt"
 )
 
-// ============ AMQP 监听桥接 - 单向职责：从MQ消费事件 ============
-
-// AMQPListener AMQP 事件监听器 - 负责从RabbitMQ监听消息并转发到内存总线
-// 职责单一：只从MQ消费，转发到内存总线
-// 不拦截内存事件，不自动发送回MQ（避免死循环）
+// AMQPListener RabbitMQ → 内存总线的单向桥接。
+// 职责单一：从 MQ 消费消息，转为 Event 后发布到本地 EventBus。
+// 不拦截本地事件，不自动回发到 MQ（避免消息循环）。
 type AMQPListener struct {
 	eventBus   *EventBus          // 内存事件总线
 	subscriber *amqpclt.Subscribe // AMQP 订阅者
@@ -20,7 +17,7 @@ type AMQPListener struct {
 	done       chan struct{}      // 关闭信号
 }
 
-// NewAMQPListener 创建AMQP监听器
+// NewAMQPListener 创建 AMQP 监听器。
 func NewAMQPListener(eventBus *EventBus, subscriber *amqpclt.Subscribe) *AMQPListener {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &AMQPListener{
@@ -32,34 +29,30 @@ func NewAMQPListener(eventBus *EventBus, subscriber *amqpclt.Subscribe) *AMQPLis
 	}
 }
 
-// StartListener 启动监听 - 从RabbitMQ消费消息并转发到内存总线
-// 特点：
-//   - 单向流向：MQ → 内存总线
-//   - 不拦截内存事件
-//   - 标记事件Source为"amqp"，便于追踪
-//   - 与程序生命周期同步
+// StartListener 启动监听，从 RabbitMQ 消费消息并转发到本地 EventBus。
+// 转发的 Event.Source 标记为 "amqp"，便于区分来源。
 func (listener *AMQPListener) StartListener(ctx context.Context) error {
 	go func() {
 		defer close(listener.done)
 
-		msgCh, cleanup, err := listener.subscriber.Subscribe(listener.ctx)
+		msgCh, cleanup, err := listener.subscriber.Subscribe(ctx)
 		if err != nil {
-			klog.Errorf("[AMQPListener] failed to subscribe: %v", err)
+			logError("[AMQPListener] failed to subscribe: %v", err)
 			return
 		}
 		defer cleanup()
 
-		klog.Infof("[AMQPListener] started, waiting for messages from RabbitMQ...")
+		logInfo("[AMQPListener] started, waiting for messages from RabbitMQ...")
 
 		for {
 			select {
-			case <-listener.ctx.Done():
-				klog.Infof("[AMQPListener] shutdown")
+			case <-ctx.Done():
+				logInfo("[AMQPListener] shutdown")
 				return
 
 			case msg, ok := <-msgCh:
 				if !ok {
-					klog.Warn("[AMQPListener] message channel closed")
+					logWarn("[AMQPListener] message channel closed")
 					return
 				}
 
@@ -75,7 +68,7 @@ func (listener *AMQPListener) StartListener(ctx context.Context) error {
 
 				// 发布到内存总线让本服务处理
 				listener.eventBus.Publish(ctx, event)
-				klog.Infof("[AMQPListener] event forwarded from MQ to memory bus, topic=%s, eventId=%s", event.Topic, event.Id)
+				logInfo("[AMQPListener] event forwarded from MQ to memory bus, topic=%s, eventId=%s", event.Topic, event.Id)
 			}
 		}
 	}()
@@ -83,21 +76,21 @@ func (listener *AMQPListener) StartListener(ctx context.Context) error {
 	return nil
 }
 
-// Stop 优雅关闭监听
+// Stop 停止监听，等待内部 goroutine 退出。
 func (listener *AMQPListener) Stop() error {
 	listener.cancel()
 	<-listener.done
-	klog.Infof("[AMQPListener] stopped")
 	return nil
 }
 
-// ============ 向后兼容：保留AMQPBridge别名 ============
+// ============ 向后兼容别名 ============
 
-// AMQPBridge 别名 - 为了向后兼容，保留原有名称
-// 建议新代码使用 AMQPListener
+// AMQPBridge 是 AMQPListener 的别名，向后兼容。
+// Deprecated: 新代码请使用 AMQPListener。
 type AMQPBridge = AMQPListener
 
-// NewAMQPBridge 兼容函数
+// NewAMQPBridge 兼容构造函数。
+// Deprecated: 新代码请使用 NewAMQPListener。
 func NewAMQPBridge(eventBus *EventBus, publisher *amqpclt.Publish, subscriber *amqpclt.Subscribe) *AMQPBridge {
 	// 忽略publisher参数，只使用subscriber
 	return NewAMQPListener(eventBus, subscriber)

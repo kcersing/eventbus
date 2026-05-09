@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"github.com/cloudwego/kitex/pkg/klog"
 )
 
 // ============ 消费者注册表 ============
 
-// ConsumerConfig 定义了消费者的配置
+// ConsumerConfig 消费者配置，将 Handler + Topic + 池参数绑定为一个消费单元。
 type ConsumerConfig struct {
 	Topic       string               // 事件主题
 	HandlerName string               // 处理器名字
@@ -18,7 +16,8 @@ type ConsumerConfig struct {
 	PoolOpts    []func(*PoolOptions) // 消费者池的配置选项
 }
 
-// ConsumerRegistry 消费者注册表 - 集中管理消费者
+// ConsumerRegistry 集中管理消费者的注册和生命周期。
+// 先 RegisterHandler 注册处理函数，再 RegisterConsumer 绑定 topic → 最后 StartAll 一键启动。
 type ConsumerRegistry struct {
 	mu            sync.RWMutex
 	handlers      map[string]Handler // handlerName → Handler
@@ -45,7 +44,7 @@ func (cr *ConsumerRegistry) RegisterHandler(name string, handler Handler) error 
 	}
 
 	cr.handlers[name] = handler
-	klog.Infof("[Registry] Handler registered: %s", name)
+	logInfo("[Registry] Handler registered: %s", name)
 	return nil
 }
 
@@ -66,7 +65,7 @@ func (cr *ConsumerRegistry) RegisterConsumer(topic, handlerName string, workerNu
 	}
 
 	cr.configs = append(cr.configs, config)
-	klog.Infof("[Registry] Consumer configured: topic=%s, handler=%s, workers=%d",
+	logInfo("[Registry] Consumer configured: topic=%s, handler=%s, workers=%d",
 		topic, handlerName, workerNum)
 	return nil
 }
@@ -84,15 +83,15 @@ func (cr *ConsumerRegistry) StartAll(eb *EventBus) error {
 		handler, ok := cr.handlers[config.HandlerName]
 		if !ok {
 			// 这在正常情况下不应该发生，因为RegisterConsumer已经检查过了
-			klog.Errorf("[Registry] Critical: Handler %s not found during StartAll", config.HandlerName)
+			logError("[Registry] Critical: Handler %s not found during StartAll", config.HandlerName)
 			continue
 		}
 
 		// 使用新的接口和选项来订阅
-		subscription := eb.SubscribeWithPool(config.Topic, handler, config.WorkerNum, config.PoolOpts...)
+		subscription := eb.SubscribeWithPool(context.Background(), config.Topic, handler, config.WorkerNum, config.PoolOpts...)
 		cr.subscriptions = append(cr.subscriptions, subscription)
 
-		klog.Infof("[Registry] Consumer started: topic=%s, handler=%s, workers=%d",
+		logInfo("[Registry] Consumer started: topic=%s, handler=%s, workers=%d",
 			config.Topic, config.HandlerName, config.WorkerNum)
 	}
 	return nil
@@ -103,13 +102,13 @@ func (cr *ConsumerRegistry) Shutdown(ctx context.Context) error {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
-	klog.Info("[Registry] Shutting down all consumers...")
+	logInfo("[Registry] Shutting down all consumers...")
 	for _, sub := range cr.subscriptions {
 		sub.Unsubscribe()
 	}
 	// 清空订阅列表，允许再次启动
 	cr.subscriptions = []Subscription{}
-	klog.Info("[Registry] All consumers shut down.")
+	logInfo("[Registry] All consumers shut down.")
 	return nil
 }
 

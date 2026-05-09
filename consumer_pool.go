@@ -4,64 +4,79 @@ import (
 	"context"
 	"sync"
 	"time"
-
-	"github.com/cloudwego/kitex/pkg/klog"
 )
 
 // FailHandler 定义了当事件无法入队时的处理函数
 type FailHandler func(event *Event, err error)
+
+// DeadLetterFunc 重试耗尽后的死信处理（如写入死信 topic、落盘等）
+type DeadLetterFunc func(event *Event)
 
 // PoolOptions 定义了消费者池的配置选项
 type PoolOptions struct {
 	QueueSize      int
 	HandlerTimeout time.Duration
 	FailHandler    FailHandler
+	MaxRetries     int             // 最大重试次数（0=不重试）
+	RetryBackoff   time.Duration   // 重试基础间隔（默认 1s，指数退避）
+	DeadLetterFunc DeadLetterFunc  // 重试耗尽回调
 }
 
 // WithQueueSize 设置消费者池的队列大小
 func WithQueueSize(size int) func(*PoolOptions) {
-	return func(o *PoolOptions) {
-		o.QueueSize = size
-	}
+	return func(o *PoolOptions) { o.QueueSize = size }
 }
 
 // WithHandlerTimeout 设置处理器的超时时间
 func WithHandlerTimeout(timeout time.Duration) func(*PoolOptions) {
-	return func(o *PoolOptions) {
-		o.HandlerTimeout = timeout
-	}
+	return func(o *PoolOptions) { o.HandlerTimeout = timeout }
 }
 
 // WithFailHandler 设置自定义的失败处理器
 func WithFailHandler(handler FailHandler) func(*PoolOptions) {
-	return func(o *PoolOptions) {
-		o.FailHandler = handler
-	}
+	return func(o *PoolOptions) { o.FailHandler = handler }
 }
 
-// ConsumerPool 消费者池 - 用于高吞吐场景
+// WithMaxRetries 设置最大重试次数
+func WithMaxRetries(n int) func(*PoolOptions) {
+	return func(o *PoolOptions) { o.MaxRetries = n }
+}
+
+// WithRetryBackoff 设置重试基础间隔
+func WithRetryBackoff(d time.Duration) func(*PoolOptions) {
+	return func(o *PoolOptions) { o.RetryBackoff = d }
+}
+
+// WithDeadLetterFunc 设置死信处理器
+func WithDeadLetterFunc(fn DeadLetterFunc) func(*PoolOptions) {
+	return func(o *PoolOptions) { o.DeadLetterFunc = fn }
+}
+
+// ConsumerPool 消费者池，多 worker 并发消费事件。
+// 支持：超时控制、指数退避重试（MaxRetries / RetryBackoff）、死信回调（DeadLetterFunc）、Metrics 埋点。
 type ConsumerPool struct {
-	name      string             // 消费者池的名字（用于日志/识别）
-	handler   Handler            // 事件处理器（处理每个事件）
-	workerNum int32              // 工作线程数量（并发度）
-	queue     chan *Event        // 事件队列（缓冲通道）
-	wg        sync.WaitGroup     // 等待组（确保优雅关闭）
-	ctx       context.Context    // 上下文（用于控制）
-	cancel    context.CancelFunc // 取消函数（停止所有 worker）
-	options   PoolOptions        // 池的配置选项
+	name      string
+	handler   Handler
+	workerNum int32
+	queue     chan *Event
+	wg        sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
+	options   PoolOptions
+	metrics   Metrics
 }
 
 // NewConsumerPool 创建消费者池
 func NewConsumerPool(name string, handler Handler, workerNum int32, opts ...func(*PoolOptions)) *ConsumerPool {
-	// 默认选项
 	options := PoolOptions{
 		QueueSize:      DefaultConfig.QueueSize,
 		HandlerTimeout: DefaultConfig.HandlerTimeout,
-		FailHandler: func(event *Event, err error) { // 默认失败处理器
-			klog.Warnf("警告: 消费者池 %s 队列已满或已关闭，丢弃事件. Topic: %s", name, event.Topic)
+		FailHandler: func(event *Event, err error) {
+			logWarn("警告: 消费者池 %s 队列已满或已关闭，丢弃事件. Topic: %s", name, event.Topic)
 		},
+		MaxRetries:   0,
+		RetryBackoff: time.Second,
 	}
-	// 应用用户提供的选项
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -75,6 +90,14 @@ func NewConsumerPool(name string, handler Handler, workerNum int32, opts ...func
 		ctx:       ctx,
 		cancel:    cancel,
 		options:   options,
+		metrics:   noopMetrics{},
+	}
+}
+
+// SetMetrics 注入自定义 Metrics 实现
+func (cp *ConsumerPool) SetMetrics(m Metrics) {
+	if m != nil {
+		cp.metrics = m
 	}
 }
 
@@ -96,25 +119,62 @@ func (cp *ConsumerPool) worker() {
 			if !ok {
 				return
 			}
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						klog.Errorf("[Pool Recover] pool=%s panic: %v", cp.name, r)
-					}
-				}()
-
-				handlerCtx := cp.ctx
-				if cp.options.HandlerTimeout > 0 {
-					var cancel context.CancelFunc
-					handlerCtx, cancel = context.WithTimeout(cp.ctx, cp.options.HandlerTimeout)
-					defer cancel()
-				}
-				if err := cp.handler.Handle(handlerCtx, event); err != nil {
-
-					klog.Errorf("[Pool Handler Error] pool=%s error: %v event:%s", cp.name, err, event)
-				}
-			}()
+			cp.processEvent(event)
 		}
+	}
+}
+
+func (cp *ConsumerPool) processEvent(event *Event) {
+	defer func() {
+		if r := recover(); r != nil {
+			cp.metrics.IncError(event.Topic)
+			logError("[Pool Recover] pool=%s panic: %v", cp.name, r)
+		}
+	}()
+
+	for attempt := 0; attempt <= cp.options.MaxRetries; attempt++ {
+		handlerCtx := cp.ctx
+		var cancel context.CancelFunc
+		if cp.options.HandlerTimeout > 0 {
+			handlerCtx, cancel = context.WithTimeout(cp.ctx, cp.options.HandlerTimeout)
+		}
+
+		start := time.Now()
+		err := cp.handler.Handle(handlerCtx, event)
+		if cancel != nil {
+			cancel()
+		}
+		cp.metrics.ObserveHandleDuration(event.Topic, float64(time.Since(start).Microseconds()))
+
+		if err == nil {
+			return // 成功
+		}
+
+		cp.metrics.IncError(event.Topic)
+
+		if attempt == cp.options.MaxRetries {
+			logError("[Pool Handler Error] pool=%s retries exhausted (%d), error=%v", cp.name, cp.options.MaxRetries, err)
+			cp.deadLetter(event)
+			return
+		}
+
+		// 指数退避重试
+		backoff := cp.options.RetryBackoff
+		sleep := backoff * time.Duration(1<<attempt)
+		logWarn("[Pool Retry] pool=%s attempt=%d/%d topic=%s error=%v sleeping=%v", cp.name, attempt+1, cp.options.MaxRetries, event.Topic, err, sleep)
+		select {
+		case <-cp.ctx.Done():
+			cp.deadLetter(event)
+			return
+		case <-time.After(sleep):
+		}
+	}
+}
+
+// deadLetter 调用 DeadLetterFunc 处理重试耗尽的事件（如写入死信 topic、落盘、告警）。
+func (cp *ConsumerPool) deadLetter(event *Event) {
+	if cp.options.DeadLetterFunc != nil {
+		cp.options.DeadLetterFunc(event)
 	}
 }
 
@@ -122,11 +182,13 @@ func (cp *ConsumerPool) worker() {
 func (cp *ConsumerPool) Consume(event *Event) {
 	select {
 	case <-cp.ctx.Done():
+		cp.metrics.IncDropped(event.Topic)
 		cp.options.FailHandler(event, context.Canceled)
 		return
 	case cp.queue <- event:
-		// 写入成功
+		cp.metrics.SetQueueDepth(event.Topic, len(cp.queue))
 	default:
+		cp.metrics.IncDropped(event.Topic)
 		cp.options.FailHandler(event, ErrQueueFull)
 	}
 }

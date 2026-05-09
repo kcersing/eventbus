@@ -7,19 +7,17 @@ import (
 	"time"
 
 	"github.com/kcersing/amqpclt"
-
-	"github.com/cloudwego/kitex/pkg/klog"
 )
 
-// PublishScope 定义了事件的发布范围
+// PublishScope 定义事件的发布范围。
 type PublishScope int
 
 const (
-	// ScopeLocal 只发布到本地内存总线
+		// ScopeLocal 仅发布到本地内存总线（默认）。
 	ScopeLocal PublishScope = 1
-	// ScopeDistributed 发布到MQ和本地内存总线 注意事件重复执行
+		// ScopeDistributed 同时发布到 MQ 和本地内存总线，注意本地订阅者会收到事件。
 	ScopeDistributed PublishScope = 2
-	// ScopeMQOnly 只发布到MQ
+		// ScopeMQOnly 仅发布到 MQ，本地订阅者不会收到。
 	ScopeMQOnly PublishScope = 3
 )
 
@@ -28,19 +26,21 @@ type PublishOptions struct {
 	Scope PublishScope
 }
 
-// WithScope 创建一个指定发布范围的选项
+// WithScope 返回一个设置发布范围的 Option 函数。
 func WithScope(scope PublishScope) func(*PublishOptions) {
 	return func(o *PublishOptions) {
 		o.Scope = scope
 	}
 }
 
-// EventPublisher 事件发布管理器 - 负责统一管理事件发布到不同目标
+// EventPublisher 统一事件发布入口，根据 Scope 将事件路由到内存总线和/或 MQ。
+// 内部使用 mqQueue + 后台 worker 批量推送到 MQ，队列满时通过 semaphore 降级为异步直接发送。
 type EventPublisher struct {
-	memoryBus *EventBus        // 内存事件总线
-	amqpPub   *amqpclt.Publish // AMQP 发布者（可选）
-	mqQueue   chan *Event      // 本地队列，由后台 worker 负责推送到 MQ
-	wg        sync.WaitGroup
+	memoryBus   *EventBus        // 内存事件总线
+	amqpPub     *amqpclt.Publish // AMQP 发布者（可选）
+	mqQueue     chan *Event      // 本地队列，由后台 worker 负责推送到 MQ
+	fallbackSem chan struct{}    // 降级 goroutine 信号量，限制并发数
+	wg          sync.WaitGroup
 }
 
 // NewEventPublisher 创建事件发布管理器
@@ -52,6 +52,7 @@ func NewEventPublisher(memoryBus *EventBus, amqpPub *amqpclt.Publish) *EventPubl
 	if amqpPub != nil {
 		// 使用默认队列大小
 		pub.mqQueue = make(chan *Event, DefaultConfig.QueueSize)
+		pub.fallbackSem = make(chan struct{}, 100) // 降级 goroutine 上限
 		pub.wg.Add(1)
 		go func() {
 			defer pub.wg.Done()
@@ -77,35 +78,54 @@ func (pub *EventPublisher) Publish(ctx context.Context, topic string, payload an
 	case ScopeLocal:
 		event.Source = "local"
 		pub.memoryBus.Publish(ctx, event)
-		klog.Infof("[Publish] Event published to memory bus only, topic=%s, eventId=%s", topic, event.Id)
+		pub.memoryBus.metrics.IncPublished(topic)
+		logInfo("[Publish] Event published to memory bus only, topic=%s, eventId=%s", topic, event.Id)
 
 	case ScopeDistributed:
 		if pub.amqpPub == nil {
-			klog.Warnf("[Publish] AMQP publisher not configured for distributed scope, falling back to local only")
+			logWarn("[Publish] AMQP publisher not configured for distributed scope, falling back to local only")
 			return pub.Publish(ctx, topic, payload, WithScope(ScopeLocal))
 		}
-		event.Source = "service"
+		event.Source = "distributed"
 		// 把事件放入 MQ 队列，由后台 worker 负责发送，避免为每次发布起 goroutine
 		select {
 		case pub.mqQueue <- event:
 		default:
-			// 队列满时降级为直接异步发送，避免丢弃事件
-			go pub.publishToMQ(context.Background(), event)
+			// 队列满时降级为直接异步发送，用信号量限制并发 goroutine 数量
+			select {
+			case pub.fallbackSem <- struct{}{}:
+				go func() {
+					defer func() { <-pub.fallbackSem }()
+					pub.publishToMQ(context.Background(), event)
+				}()
+			default:
+				logError("[Publish] MQ 队列满且降级通道也满，丢弃事件 topic=%s", topic)
+			}
 		}
 		// 发送到内存总线
 		pub.memoryBus.Publish(ctx, event)
-		klog.Infof("[Publish] Event queued for MQ and published to memory bus, topic=%s, eventId=%s", topic, event.Id)
+		pub.memoryBus.metrics.IncPublished(topic)
+		logInfo("[Publish] Event queued for MQ and published to memory bus, topic=%s, eventId=%s", topic, event.Id)
 
 	case ScopeMQOnly:
 		if pub.amqpPub == nil {
 
 			return fmt.Errorf("[Publish] AMQP publisher not configured, cannot publish to MQ only")
 		}
-		event.Source = "service"
+		event.Source = "amqp"
 		select {
 		case pub.mqQueue <- event:
 		default:
-			go pub.publishToMQ(context.Background(), event)
+			// 队列满时降级，用信号量限制并发 goroutine 数量
+			select {
+			case pub.fallbackSem <- struct{}{}:
+				go func() {
+					defer func() { <-pub.fallbackSem }()
+					pub.publishToMQ(context.Background(), event)
+				}()
+			default:
+				logError("[Publish] MQ 队列满且降级通道也满，丢弃事件 topic=%s", topic)
+			}
 		}
 
 	default:
@@ -122,15 +142,16 @@ func (pub *EventPublisher) publishToMQ(ctx context.Context, event *Event) error 
 		Timestamp: time.Now(),
 	}
 	err := pub.amqpPub.Publish(ctx, event.Topic, event.Id, msg)
+	pub.memoryBus.metrics.IncMQPublished(event.Topic, err == nil)
 	if err != nil {
-		klog.Errorf("[Publish] publish to MQ failed, topic=%s, error=%v", event.Topic, err)
+		logError("[Publish] publish to MQ failed, topic=%s, error=%v", event.Topic, err)
 	} else {
-		klog.Infof("[Publish] event published to MQ, topic=%s, eventId=%s", event.Topic, event.Id)
+		logInfo("[Publish] event published to MQ, topic=%s, eventId=%s", event.Topic, event.Id)
 	}
 	return err
 }
 
-// startMQWorker 从本地队列消费事件并发送到 MQ
+// startMQWorker 后台 worker：从 mqQueue 取事件，串行推送到 MQ。
 func (pub *EventPublisher) startMQWorker() {
 	for ev := range pub.mqQueue {
 		if ev == nil {
@@ -138,12 +159,12 @@ func (pub *EventPublisher) startMQWorker() {
 		}
 		// 使用背景上下文，不应阻塞主业务流程
 		if err := pub.publishToMQ(context.Background(), ev); err != nil {
-			klog.Errorf("[MQWorker] publish failed: %v", err)
+			logError("[MQWorker] publish failed: %v", err)
 		}
 	}
 }
 
-// Close 优雅关闭发布器（等待后台 worker 退出）
+// Close 关闭 mqQueue 并等待后台 worker 退出。
 func (pub *EventPublisher) Close() error {
 	if pub.mqQueue != nil {
 		close(pub.mqQueue)
@@ -152,19 +173,19 @@ func (pub *EventPublisher) Close() error {
 	return nil
 }
 
-// ============ 方便的简写方法 ============
+// ============ 便捷简写方法 ============
 
-// Local 短方法：发布到本地内存
+// Local 发布到本地内存总线（等价于 Publish(..., WithScope(ScopeLocal))）。
 func (pub *EventPublisher) Local(ctx context.Context, topic string, payload any) error {
 	return pub.Publish(ctx, topic, payload, WithScope(ScopeLocal))
 }
 
-// Distributed 短方法：发布到分布式
+// Distributed 发布到 MQ 和本地内存（等价于 Publish(..., WithScope(ScopeDistributed))）。
 func (pub *EventPublisher) Distributed(ctx context.Context, topic string, payload any) error {
 	return pub.Publish(ctx, topic, payload, WithScope(ScopeDistributed))
 }
 
-// MQOnly 短方法：只发到MQ
+// MQOnly 仅发布到 MQ（等价于 Publish(..., WithScope(ScopeMQOnly))）。
 func (pub *EventPublisher) MQOnly(ctx context.Context, topic string, payload any) error {
 	return pub.Publish(ctx, topic, payload, WithScope(ScopeMQOnly))
 }

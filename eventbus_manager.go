@@ -3,10 +3,10 @@ package eventbus
 import (
 	"context"
 
-	"github.com/cloudwego/kitex/pkg/klog"
 )
 
-// EventManager 统一管理事件总线、桥接器和消费者注册表
+// EventManager 统一管理所有事件组件的生命周期（EventBus、AMQPListener、ConsumerRegistry、EventPublisher）。
+// 调用 Start 一键启动所有组件，Shutdown 按序优雅关闭。
 type EventManager struct {
 	Bus       *EventBus
 	Bridge    *AMQPListener
@@ -14,7 +14,7 @@ type EventManager struct {
 	Publisher *EventPublisher
 }
 
-// NewEventManager 是 EventManager 的构造函数
+// NewEventManager 创建 EventManager 实例。
 func NewEventManager(
 	bus *EventBus,
 	bridge *AMQPListener,
@@ -29,31 +29,32 @@ func NewEventManager(
 	}
 }
 
-// Start 启动所有组件
+// Start 启动 AMQP 监听器和消费者注册表中的所有消费者。
 func (em *EventManager) Start(ctx context.Context) error {
-	klog.Info("[EventManager] Starting all components...")
+	logInfo("[EventManager] Starting all components...")
 	if err := em.Bridge.StartListener(ctx); err != nil {
 		return err
 	}
 	if err := em.Registry.StartAll(em.Bus); err != nil {
 		return err
 	}
-	klog.Info("[EventManager] All components started successfully.")
+	logInfo("[EventManager] All components started successfully.")
 	return nil
 }
 
-// Shutdown 优雅地关闭整个事件系统
+// Shutdown 按序优雅关闭：Bridge.Stop → Registry.Shutdown → Bus.Close → Publisher.Close。
 func (em *EventManager) Shutdown(ctx context.Context) error {
-	klog.Info("[EventManager] Shutting down EventManager...")
-
 	if err := em.Bridge.Stop(); err != nil {
-		klog.Errorf("[EventManager] Failed to stop AMQP listener: %v", err)
+		return err
 	}
-
 	if err := em.Registry.Shutdown(ctx); err != nil {
-		klog.Errorf("[EventManager] Failed to shutdown consumer registry: %v", err)
+		return err
 	}
-
-	klog.Info("[EventManager] EventManager shut down complete.")
+	if err := em.Bus.Close(); err != nil {
+		return err
+	}
+	if err := em.Publisher.Close(); err != nil {
+		return err
+	}
 	return nil
 }
