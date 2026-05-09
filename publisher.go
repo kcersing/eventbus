@@ -79,11 +79,11 @@ func (pub *EventPublisher) Publish(ctx context.Context, topic string, payload an
 		event.Source = "local"
 		pub.memoryBus.Publish(ctx, event)
 		pub.memoryBus.metrics.IncPublished(topic)
-		logInfo("[Publish] Event published to memory bus only, topic=%s, eventId=%s", topic, event.Id)
+		logInfo("[发布] 事件已发布到内存总线, topic=%s, eventId=%s", topic, event.Id)
 
 	case ScopeDistributed:
 		if pub.amqpPub == nil {
-			logWarn("[Publish] AMQP publisher not configured for distributed scope, falling back to local only")
+			logWarn("[发布] 未配置 AMQP，分布式作用域降级为仅本地发布")
 			return pub.Publish(ctx, topic, payload, WithScope(ScopeLocal))
 		}
 		event.Source = "distributed"
@@ -99,18 +99,18 @@ func (pub *EventPublisher) Publish(ctx context.Context, topic string, payload an
 					pub.publishToMQ(context.Background(), event)
 				}()
 			default:
-				logError("[Publish] MQ 队列满且降级通道也满，丢弃事件 topic=%s", topic)
+				logError("[发布] MQ队列和降级通道均已满，事件丢弃 topic=%s", topic)
 			}
 		}
 		// 发送到内存总线
 		pub.memoryBus.Publish(ctx, event)
 		pub.memoryBus.metrics.IncPublished(topic)
-		logInfo("[Publish] Event queued for MQ and published to memory bus, topic=%s, eventId=%s", topic, event.Id)
+		logInfo("[发布] 事件已入队MQ并发布到内存总线, topic=%s, eventId=%s", topic, event.Id)
 
 	case ScopeMQOnly:
 		if pub.amqpPub == nil {
 
-			return fmt.Errorf("[Publish] AMQP publisher not configured, cannot publish to MQ only")
+			return fmt.Errorf("[发布] 未配置 AMQP 发布者，无法仅发布到 MQ")
 		}
 		event.Source = "amqp"
 		select {
@@ -129,7 +129,7 @@ func (pub *EventPublisher) Publish(ctx context.Context, topic string, payload an
 		}
 
 	default:
-		err = fmt.Errorf("unknown publish scope: %v", options.Scope)
+		err = fmt.Errorf("未知的发布作用域: %v", options.Scope)
 	}
 
 	return err
@@ -144,9 +144,9 @@ func (pub *EventPublisher) publishToMQ(ctx context.Context, event *Event) error 
 	err := pub.amqpPub.Publish(ctx, event.Topic, event.Id, msg)
 	pub.memoryBus.metrics.IncMQPublished(event.Topic, err == nil)
 	if err != nil {
-		logError("[Publish] publish to MQ failed, topic=%s, error=%v", event.Topic, err)
+		logError("[发布] 发送到 MQ 失败, topic=%s, error=%v", event.Topic, err)
 	} else {
-		logInfo("[Publish] event published to MQ, topic=%s, eventId=%s", event.Topic, event.Id)
+		logInfo("[发布] 事件已发送到 MQ, topic=%s, eventId=%s", event.Topic, event.Id)
 	}
 	return err
 }
@@ -159,7 +159,7 @@ func (pub *EventPublisher) startMQWorker() {
 		}
 		// 使用背景上下文，不应阻塞主业务流程
 		if err := pub.publishToMQ(context.Background(), ev); err != nil {
-			logError("[MQWorker] publish failed: %v", err)
+			logError("[MQWorker] 发布失败: %v", err)
 		}
 	}
 }

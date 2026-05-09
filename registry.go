@@ -40,11 +40,11 @@ func (cr *ConsumerRegistry) RegisterHandler(name string, handler Handler) error 
 	defer cr.mu.Unlock()
 
 	if _, exists := cr.handlers[name]; exists {
-		return fmt.Errorf("handler %s already exists", name)
+		return fmt.Errorf("处理器 %s 已存在", name)
 	}
 
 	cr.handlers[name] = handler
-	logInfo("[Registry] Handler registered: %s", name)
+	logInfo("[注册表] 处理器已注册: %s", name)
 	return nil
 }
 
@@ -54,7 +54,7 @@ func (cr *ConsumerRegistry) RegisterConsumer(topic, handlerName string, workerNu
 	defer cr.mu.Unlock()
 
 	if _, exists := cr.handlers[handlerName]; !exists {
-		return fmt.Errorf("handler %s not found", handlerName)
+		return fmt.Errorf("处理器 %s 不存在", handlerName)
 	}
 
 	config := &ConsumerConfig{
@@ -65,7 +65,7 @@ func (cr *ConsumerRegistry) RegisterConsumer(topic, handlerName string, workerNu
 	}
 
 	cr.configs = append(cr.configs, config)
-	logInfo("[Registry] Consumer configured: topic=%s, handler=%s, workers=%d",
+	logInfo("[注册表] 消费者已配置: topic=%s, handler=%s, workers=%d",
 		topic, handlerName, workerNum)
 	return nil
 }
@@ -76,14 +76,14 @@ func (cr *ConsumerRegistry) StartAll(eb *EventBus) error {
 	defer cr.mu.Unlock()
 
 	if len(cr.subscriptions) > 0 {
-		return fmt.Errorf("registry already started")
+		return fmt.Errorf("注册表已经启动")
 	}
 
 	for _, config := range cr.configs {
 		handler, ok := cr.handlers[config.HandlerName]
 		if !ok {
 			// 这在正常情况下不应该发生，因为RegisterConsumer已经检查过了
-			logError("[Registry] Critical: Handler %s not found during StartAll", config.HandlerName)
+			logError("[注册表] 严重错误: 启动时未找到处理器 %s", config.HandlerName)
 			continue
 		}
 
@@ -91,7 +91,7 @@ func (cr *ConsumerRegistry) StartAll(eb *EventBus) error {
 		subscription := eb.SubscribeWithPool(context.Background(), config.Topic, handler, config.WorkerNum, config.PoolOpts...)
 		cr.subscriptions = append(cr.subscriptions, subscription)
 
-		logInfo("[Registry] Consumer started: topic=%s, handler=%s, workers=%d",
+		logInfo("[注册表] 消费者已启动: topic=%s, handler=%s, workers=%d",
 			config.Topic, config.HandlerName, config.WorkerNum)
 	}
 	return nil
@@ -102,13 +102,13 @@ func (cr *ConsumerRegistry) Shutdown(ctx context.Context) error {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
-	logInfo("[Registry] Shutting down all consumers...")
+	logInfo("[注册表] 正在关闭所有消费者...")
 	for _, sub := range cr.subscriptions {
 		sub.Unsubscribe()
 	}
 	// 清空订阅列表，允许再次启动
 	cr.subscriptions = []Subscription{}
-	logInfo("[Registry] All consumers shut down.")
+	logInfo("[注册表] 所有消费者已关闭")
 	return nil
 }
 

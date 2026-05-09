@@ -37,22 +37,22 @@ func (listener *AMQPListener) StartListener(ctx context.Context) error {
 
 		msgCh, cleanup, err := listener.subscriber.Subscribe(ctx)
 		if err != nil {
-			logError("[AMQPListener] failed to subscribe: %v", err)
+			logError("[AMQP监听器] 订阅失败: %v", err)
 			return
 		}
 		defer cleanup()
 
-		logInfo("[AMQPListener] started, waiting for messages from RabbitMQ...")
+		logInfo("[AMQP监听器] 已启动，等待 RabbitMQ 消息...")
 
 		for {
 			select {
 			case <-ctx.Done():
-				logInfo("[AMQPListener] shutdown")
+				logInfo("[AMQP监听器] 已关闭")
 				return
 
 			case msg, ok := <-msgCh:
 				if !ok {
-					logWarn("[AMQPListener] message channel closed")
+					logWarn("[AMQP监听器] 消息通道已关闭")
 					return
 				}
 
@@ -68,7 +68,7 @@ func (listener *AMQPListener) StartListener(ctx context.Context) error {
 
 				// 发布到内存总线让本服务处理
 				listener.eventBus.Publish(ctx, event)
-				logInfo("[AMQPListener] event forwarded from MQ to memory bus, topic=%s, eventId=%s", event.Topic, event.Id)
+				logInfo("[AMQP监听器] 事件已从 MQ 转发到内存总线, topic=%s, eventId=%s", event.Topic, event.Id)
 			}
 		}
 	}()

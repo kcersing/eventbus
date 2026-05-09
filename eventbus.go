@@ -65,7 +65,7 @@ func (eb *EventBus) dispatch(ctx context.Context, event *Event) error {
 			eb.metrics.IncDispatched(event.Topic)
 		default:
 			eb.metrics.IncDropped(event.Topic)
-			logWarn("警告: 主题 %s 的订阅者通道已满，丢弃事件。", event.Topic)
+			logWarn("主题 %s 的订阅者通道已满，事件丢弃", event.Topic)
 		}
 		return nil
 	}
@@ -96,7 +96,7 @@ func (eb *EventBus) dispatch(ctx context.Context, event *Event) error {
 			eb.metrics.IncDispatched(event.Topic)
 		default:
 			eb.metrics.IncDropped(event.Topic)
-			logWarn("警告: 主题 %s 的一个订阅者通道已满，丢弃事件。", event.Topic)
+			logWarn("主题 %s 的订阅者通道已满，事件丢弃", event.Topic)
 		}
 	}
 	return nil
@@ -122,7 +122,7 @@ func (eb *EventBus) Use(mw ...Middleware) {
 // Publish 发布事件到内存总线，经中间件链处理后分发给匹配的订阅者。
 func (eb *EventBus) Publish(ctx context.Context, event *Event) {
 	if err := eb.chain.Handle(ctx, event); err != nil {
-		logError("[Error] Handle event failed: %v", err)
+		logError("[错误] 事件处理失败: %v", err)
 	}
 }
 
@@ -168,7 +168,7 @@ func (eb *EventBus) Unsubscribe(topic string, ch EventChan) {
 						if len(eb.wildcardSubs[i].channels) == 0 {
 							eb.wildcardSubs = append(eb.wildcardSubs[:i], eb.wildcardSubs[i+1:]...)
 						}
-						logInfo("已取消通配符订阅主题: %s", topic)
+						logInfo("已取消通配符订阅: %s", topic)
 						return
 					}
 				}
@@ -183,7 +183,7 @@ func (eb *EventBus) Unsubscribe(topic string, ch EventChan) {
 				eb.subscribers[topic] = append(subscribers[:i], subscribers[i+1:]...)
 				// 只有在通道确认不再被任何goroutine使用时才能安全关闭
 				// close(ch)
-				logInfo("已取消订阅主题: %s", topic)
+				logInfo("已取消订阅: %s", topic)
 				return
 			}
 		}

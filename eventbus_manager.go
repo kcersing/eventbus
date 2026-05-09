@@ -31,14 +31,14 @@ func NewEventManager(
 
 // Start 启动 AMQP 监听器和消费者注册表中的所有消费者。
 func (em *EventManager) Start(ctx context.Context) error {
-	logInfo("[EventManager] Starting all components...")
+	logInfo("[事件管理器] 正在启动所有组件...")
 	if err := em.Bridge.StartListener(ctx); err != nil {
 		return err
 	}
 	if err := em.Registry.StartAll(em.Bus); err != nil {
 		return err
 	}
-	logInfo("[EventManager] All components started successfully.")
+	logInfo("[事件管理器] 所有组件启动成功")
 	return nil
 }
 

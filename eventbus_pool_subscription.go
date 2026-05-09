@@ -26,7 +26,7 @@ func (s *poolSubscription) Unsubscribe() {
 		s.eb.Unsubscribe(s.topic, s.ch) // 从EventBus中移除通道
 		close(s.ch)
 		s.eb.untrackSub(s)
-		logInfo("[Unsubscribe] 消费者池订阅已取消, topic=%s", s.topic)
+		logInfo("[取消订阅] 消费者池订阅已取消, topic=%s", s.topic)
 	})
 }
 

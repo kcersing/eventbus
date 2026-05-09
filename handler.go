@@ -41,17 +41,17 @@ func WrapTyped[T any](handler TypedHandler[T]) Handler {
 		if mapPayload, ok := event.Payload.(map[string]interface{}); ok {
 			jsonBytes, err := json.Marshal(mapPayload)
 			if err != nil {
-				return fmt.Errorf("failed to marshal payload map: %w", err)
+				return fmt.Errorf("序列化 Payload 失败: %w", err)
 			}
 
 			var typedPayload T
 			if err := json.Unmarshal(jsonBytes, &typedPayload); err != nil {
-				return fmt.Errorf("failed to unmarshal payload into %T: %w", new(T), err)
+				return fmt.Errorf("反序列化 Payload 到 %T 失败: %w", new(T), err)
 			}
 			return handler(ctx, typedPayload, event)
 		}
 
 		// 3. 如果以上都不行，返回类型不匹配错误
-		return fmt.Errorf("type mismatch: expected %T or map[string]interface{}, got %T", new(T), event.Payload)
+		return fmt.Errorf("类型不匹配: 期望 %T 或 map[string]interface{}, 实际 %T", new(T), event.Payload)
 	})
 }

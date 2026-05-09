@@ -26,7 +26,7 @@ func (s *asyncSubscription) Unsubscribe() {
 		s.eb.Unsubscribe(s.topic, s.ch)
 		close(s.ch)
 		s.eb.untrackSub(s)
-		logInfo("[Unsubscribe] 异步订阅已取消, topic=%s", s.topic)
+		logInfo("[取消订阅] 异步订阅已取消, topic=%s", s.topic)
 	})
 }
 
@@ -73,12 +73,12 @@ func (eb *EventBus) safeHandle(ctx context.Context, topic string, handler Handle
 	defer func() {
 		if r := recover(); r != nil {
 			eb.metrics.IncError(topic)
-			logError("[Panic Recover] Topic: %s, Error: %v", topic, r)
+			logError("[Panic恢复] Topic: %s, Error: %v", topic, r)
 		}
 	}()
 	if err := handler.Handle(ctx, event); err != nil {
 		eb.metrics.IncError(topic)
-		logError("[Error] Handle event failed: %v", err)
+		logError("[错误] 事件处理失败: %v", err)
 	}
 	eb.metrics.ObserveHandleDuration(topic, float64(time.Since(start).Microseconds()))
 }

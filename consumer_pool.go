@@ -128,7 +128,7 @@ func (cp *ConsumerPool) processEvent(event *Event) {
 	defer func() {
 		if r := recover(); r != nil {
 			cp.metrics.IncError(event.Topic)
-			logError("[Pool Recover] pool=%s panic: %v", cp.name, r)
+			logError("[消费者池恢复] pool=%s panic: %v", cp.name, r)
 		}
 	}()
 
@@ -153,7 +153,7 @@ func (cp *ConsumerPool) processEvent(event *Event) {
 		cp.metrics.IncError(event.Topic)
 
 		if attempt == cp.options.MaxRetries {
-			logError("[Pool Handler Error] pool=%s retries exhausted (%d), error=%v", cp.name, cp.options.MaxRetries, err)
+			logError("[消费者池处理错误] pool=%s 重试耗尽(%d次), error=%v", cp.name, cp.options.MaxRetries, err)
 			cp.deadLetter(event)
 			return
 		}
@@ -161,7 +161,7 @@ func (cp *ConsumerPool) processEvent(event *Event) {
 		// 指数退避重试
 		backoff := cp.options.RetryBackoff
 		sleep := backoff * time.Duration(1<<attempt)
-		logWarn("[Pool Retry] pool=%s attempt=%d/%d topic=%s error=%v sleeping=%v", cp.name, attempt+1, cp.options.MaxRetries, event.Topic, err, sleep)
+		logWarn("[消费者池重试] pool=%s 第%d/%d次 topic=%s error=%v 等待%v", cp.name, attempt+1, cp.options.MaxRetries, event.Topic, err, sleep)
 		select {
 		case <-cp.ctx.Done():
 			cp.deadLetter(event)
