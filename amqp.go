@@ -12,19 +12,16 @@ import (
 type AMQPListener struct {
 	eventBus   *EventBus          // 内存事件总线
 	subscriber *amqpclt.Subscribe // AMQP 订阅者
-	ctx        context.Context    // 生命周期上下文
 	cancel     context.CancelFunc // 取消函数
 	done       chan struct{}      // 关闭信号
 }
 
 // NewAMQPListener 创建 AMQP 监听器。
 func NewAMQPListener(eventBus *EventBus, subscriber *amqpclt.Subscribe) *AMQPListener {
-	ctx, cancel := context.WithCancel(context.Background())
+
 	return &AMQPListener{
 		eventBus:   eventBus,
 		subscriber: subscriber,
-		ctx:        ctx,
-		cancel:     cancel,
 		done:       make(chan struct{}),
 	}
 }
@@ -32,6 +29,7 @@ func NewAMQPListener(eventBus *EventBus, subscriber *amqpclt.Subscribe) *AMQPLis
 // StartListener 启动监听，从 RabbitMQ 消费消息并转发到本地 EventBus。
 // 转发的 Event.Source 标记为 "amqp"，便于区分来源。
 func (listener *AMQPListener) StartListener(ctx context.Context) error {
+	ctx, listener.cancel = context.WithCancel(ctx)
 	go func() {
 		defer close(listener.done)
 
@@ -81,17 +79,4 @@ func (listener *AMQPListener) Stop() error {
 	listener.cancel()
 	<-listener.done
 	return nil
-}
-
-// ============ 向后兼容别名 ============
-
-// AMQPBridge 是 AMQPListener 的别名，向后兼容。
-// Deprecated: 新代码请使用 AMQPListener。
-type AMQPBridge = AMQPListener
-
-// NewAMQPBridge 兼容构造函数。
-// Deprecated: 新代码请使用 NewAMQPListener。
-func NewAMQPBridge(eventBus *EventBus, publisher *amqpclt.Publish, subscriber *amqpclt.Subscribe) *AMQPBridge {
-	// 忽略publisher参数，只使用subscriber
-	return NewAMQPListener(eventBus, subscriber)
 }

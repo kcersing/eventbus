@@ -71,7 +71,7 @@ func (cr *ConsumerRegistry) RegisterConsumer(topic, handlerName string, workerNu
 }
 
 // StartAll 启动所有已注册的消费者
-func (cr *ConsumerRegistry) StartAll(eb *EventBus) error {
+func (cr *ConsumerRegistry) StartAll(ctx context.Context, eb *EventBus) error {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
@@ -88,11 +88,10 @@ func (cr *ConsumerRegistry) StartAll(eb *EventBus) error {
 		}
 
 		// 使用新的接口和选项来订阅
-		subscription := eb.SubscribeWithPool(context.Background(), config.Topic, handler, config.WorkerNum, config.PoolOpts...)
+		subscription := eb.SubscribeWithPool(ctx, config.Topic, handler, config.WorkerNum, config.PoolOpts...)
 		cr.subscriptions = append(cr.subscriptions, subscription)
 
-		logInfo("[注册表] 消费者已启动: topic=%s, handler=%s, workers=%d",
-			config.Topic, config.HandlerName, config.WorkerNum)
+		logInfo("[注册表] 消费者已启动: topic=%s, handler=%s, workers=%d", config.Topic, config.HandlerName, config.WorkerNum)
 	}
 	return nil
 }

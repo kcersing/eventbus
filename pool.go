@@ -17,9 +17,9 @@ type PoolOptions struct {
 	QueueSize      int
 	HandlerTimeout time.Duration
 	FailHandler    FailHandler
-	MaxRetries     int             // 最大重试次数（0=不重试）
-	RetryBackoff   time.Duration   // 重试基础间隔（默认 1s，指数退避）
-	DeadLetterFunc DeadLetterFunc  // 重试耗尽回调
+	MaxRetries     int            // 最大重试次数（0=不重试）
+	RetryBackoff   time.Duration  // 重试基础间隔（默认 1s，指数退避）
+	DeadLetterFunc DeadLetterFunc // 重试耗尽回调
 }
 
 // WithQueueSize 设置消费者池的队列大小
@@ -72,7 +72,7 @@ func NewConsumerPool(name string, handler Handler, workerNum int32, opts ...func
 		QueueSize:      DefaultConfig.QueueSize,
 		HandlerTimeout: DefaultConfig.HandlerTimeout,
 		FailHandler: func(event *Event, err error) {
-			logWarn("警告: 消费者池 %s 队列已满或已关闭，丢弃事件. Topic: %s", name, event.Topic)
+			logWarn("consumer pool queue full or closed, event dropped: pool=%s topic=%s", name, event.Topic)
 		},
 		MaxRetries:   0,
 		RetryBackoff: time.Second,
@@ -124,11 +124,21 @@ func (cp *ConsumerPool) worker() {
 	}
 }
 
+// processEvent 处理单个事件，含 panic 恢复、超时控制和指数退避重试。
+//
+// Fix #4（原始 bug）：原代码在 defer/recover 里将 panicked 置为 true，
+// 但 for 循环中 `if panicked { deadLetter(); return }` 的检查在 panic 发生后
+// 根本不会被执行——panic 已经让栈展开到 defer，recover 捕获后函数直接返回，
+// deadLetter 永远不会被调用。
+//
+// 修复方案：将死信处理直接放到 recover 块内部，确保 panic 后必然触发死信。
 func (cp *ConsumerPool) processEvent(event *Event) {
 	defer func() {
 		if r := recover(); r != nil {
+			// Fix #4: panic 在此处被捕获，直接调用 deadLetter，不再依赖循环外的标志位。
 			cp.metrics.IncError(event.Topic)
-			logError("[消费者池恢复] pool=%s panic: %v", cp.name, r)
+			logError("consumer pool panic recovered: pool=%s panic=%v", cp.name, r)
+			cp.deadLetter(event)
 		}
 	}()
 
@@ -153,15 +163,20 @@ func (cp *ConsumerPool) processEvent(event *Event) {
 		cp.metrics.IncError(event.Topic)
 
 		if attempt == cp.options.MaxRetries {
-			logError("[消费者池处理错误] pool=%s 重试耗尽(%d次), error=%v", cp.name, cp.options.MaxRetries, err)
+			logError("consumer pool retries exhausted: pool=%s retries=%d error=%v", cp.name, cp.options.MaxRetries, err)
 			cp.deadLetter(event)
 			return
 		}
 
 		// 指数退避重试
 		backoff := cp.options.RetryBackoff
-		sleep := backoff * time.Duration(1<<attempt)
-		logWarn("[消费者池重试] pool=%s 第%d/%d次 topic=%s error=%v 等待%v", cp.name, attempt+1, cp.options.MaxRetries, event.Topic, err, sleep)
+		shift := attempt
+		if shift > 10 {
+			shift = 10
+		}
+		sleep := backoff * time.Duration(1<<shift)
+		logWarn("consumer pool retry: pool=%s attempt=%d/%d topic=%s error=%v backoff=%v",
+			cp.name, attempt+1, cp.options.MaxRetries, event.Topic, err, sleep)
 		select {
 		case <-cp.ctx.Done():
 			cp.deadLetter(event)
@@ -178,7 +193,7 @@ func (cp *ConsumerPool) deadLetter(event *Event) {
 	}
 }
 
-// Consume 消费事件
+// Consume 将事件投递到消费者池队列。队列满时触发 FailHandler。
 func (cp *ConsumerPool) Consume(event *Event) {
 	select {
 	case <-cp.ctx.Done():
@@ -193,7 +208,7 @@ func (cp *ConsumerPool) Consume(event *Event) {
 	}
 }
 
-// Stop 停止消费者池
+// Stop 停止消费者池，等待所有 worker 处理完当前事件后退出。
 func (cp *ConsumerPool) Stop() {
 	cp.cancel()
 	cp.wg.Wait()

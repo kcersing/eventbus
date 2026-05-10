@@ -38,19 +38,23 @@ func WrapTyped[T any](handler TypedHandler[T]) Handler {
 		}
 
 		// 2. 如果是 map[string]interface{}, 尝试通过 json 转换
-		if mapPayload, ok := event.Payload.(map[string]interface{}); ok {
-			jsonBytes, err := json.Marshal(mapPayload)
+		if raw, ok := event.Payload.(map[string]interface{}); ok {
+			jsonBytes, err := json.Marshal(raw)
 			if err != nil {
 				return fmt.Errorf("序列化 Payload 失败: %w", err)
 			}
-
 			var typedPayload T
 			if err := json.Unmarshal(jsonBytes, &typedPayload); err != nil {
 				return fmt.Errorf("反序列化 Payload 到 %T 失败: %w", new(T), err)
 			}
 			return handler(ctx, typedPayload, event)
+		} else if raw, ok := event.Payload.([]byte); ok {
+			var typedPayload T
+			if err := json.Unmarshal(raw, &typedPayload); err != nil {
+				return fmt.Errorf("反序列化 Payload 到 %T 失败: %w", new(T), err)
+			}
+			return handler(ctx, typedPayload, event)
 		}
-
 		// 3. 如果以上都不行，返回类型不匹配错误
 		return fmt.Errorf("类型不匹配: 期望 %T 或 map[string]interface{}, 实际 %T", new(T), event.Payload)
 	})

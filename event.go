@@ -1,18 +1,22 @@
 package eventbus
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"math/rand/v2"
 	"time"
 )
 
 // newEventID 生成全局唯一的事件 ID。
 // 格式：12 字节 → 24 字符 hex（纳秒时间戳 8B + 加密随机数 4B），纳秒前缀保证时间有序。
 func newEventID() string {
+	return newEventIDWithNow(time.Now())
+}
+
+func newEventIDWithNow(now time.Time) string {
 	var b [12]byte
-	binary.BigEndian.PutUint64(b[0:8], uint64(time.Now().UnixNano()))
-	_, _ = rand.Read(b[8:12])
+	binary.BigEndian.PutUint64(b[0:8], uint64(now.UnixNano()))
+	binary.BigEndian.PutUint32(b[8:12], rand.Uint32())
 	return hex.EncodeToString(b[:])
 }
 
@@ -29,13 +33,14 @@ type Event struct {
 
 // NewEvent 创建事件，自动生成唯一 ID 和时间戳。
 func NewEvent(topic string, payload any) *Event {
+	now := time.Now()
 	return &Event{
-		Id:        newEventID(),
+		Id:        newEventIDWithNow(now),
 		Topic:     topic,
 		Payload:   payload,
 		Source:    "Local",
 		Version:   0,
-		Timestamp: time.Now(),
+		Timestamp: now,
 		Priority:  0,
 	}
 }

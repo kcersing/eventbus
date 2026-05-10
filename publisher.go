@@ -13,11 +13,11 @@ import (
 type PublishScope int
 
 const (
-		// ScopeLocal 仅发布到本地内存总线（默认）。
+	// ScopeLocal 仅发布到本地内存总线（默认）。
 	ScopeLocal PublishScope = 1
-		// ScopeDistributed 同时发布到 MQ 和本地内存总线，注意本地订阅者会收到事件。
+	// ScopeDistributed 同时发布到 MQ 和本地内存总线，注意本地订阅者会收到事件。
 	ScopeDistributed PublishScope = 2
-		// ScopeMQOnly 仅发布到 MQ，本地订阅者不会收到。
+	// ScopeMQOnly 仅发布到 MQ，本地订阅者不会收到。
 	ScopeMQOnly PublishScope = 3
 )
 
@@ -36,11 +36,13 @@ func WithScope(scope PublishScope) func(*PublishOptions) {
 // EventPublisher 统一事件发布入口，根据 Scope 将事件路由到内存总线和/或 MQ。
 // 内部使用 mqQueue + 后台 worker 批量推送到 MQ，队列满时通过 semaphore 降级为异步直接发送。
 type EventPublisher struct {
+	// Fix #5: wg 同时追踪 mqWorker 和所有降级 goroutine，Close 等待全部退出后再返回，
+	// 避免降级 goroutine 在 amqpPub 已关闭后继续使用而引发 panic。
+	wg          sync.WaitGroup
 	memoryBus   *EventBus        // 内存事件总线
 	amqpPub     *amqpclt.Publish // AMQP 发布者（可选）
-	mqQueue     chan *Event      // 本地队列，由后台 worker 负责推送到 MQ
-	fallbackSem chan struct{}    // 降级 goroutine 信号量，限制并发数
-	wg          sync.WaitGroup
+	mqQueue     chan *Event       // 本地队列，由后台 worker 负责推送到 MQ
+	fallbackSem chan struct{}     // 降级 goroutine 信号量，限制并发数
 }
 
 // NewEventPublisher 创建事件发布管理器
@@ -50,7 +52,6 @@ func NewEventPublisher(memoryBus *EventBus, amqpPub *amqpclt.Publish) *EventPubl
 		amqpPub:   amqpPub,
 	}
 	if amqpPub != nil {
-		// 使用默认队列大小
 		pub.mqQueue = make(chan *Event, DefaultConfig.QueueSize)
 		pub.fallbackSem = make(chan struct{}, 100) // 降级 goroutine 上限
 		pub.wg.Add(1)
@@ -62,10 +63,17 @@ func NewEventPublisher(memoryBus *EventBus, amqpPub *amqpclt.Publish) *EventPubl
 	return pub
 }
 
+// SetMetrics 注入自定义 Metrics 实现
+func (pub *EventPublisher) SetMetrics(m Metrics) {
+	if m != nil {
+		pub.memoryBus.SetMetrics(m)
+	}
+}
+
 // Publish 是统一的事件发布方法
 func (pub *EventPublisher) Publish(ctx context.Context, topic string, payload any, opts ...func(*PublishOptions)) error {
 	options := &PublishOptions{
-		Scope: ScopeLocal, // 默认为本地发布
+		Scope: ScopeLocal,
 	}
 	for _, opt := range opts {
 		opt(options)
@@ -79,60 +87,58 @@ func (pub *EventPublisher) Publish(ctx context.Context, topic string, payload an
 		event.Source = "local"
 		pub.memoryBus.Publish(ctx, event)
 		pub.memoryBus.metrics.IncPublished(topic)
-		logInfo("[发布] 事件已发布到内存总线, topic=%s, eventId=%s", topic, event.Id)
+		logInfo("event published to memory bus: topic=%s eventId=%s", topic, event.Id)
 
 	case ScopeDistributed:
 		if pub.amqpPub == nil {
-			logWarn("[发布] 未配置 AMQP，分布式作用域降级为仅本地发布")
+			logWarn("AMQP not configured, distributed scope downgraded to local: topic=%s", topic)
 			return pub.Publish(ctx, topic, payload, WithScope(ScopeLocal))
 		}
 		event.Source = "distributed"
-		// 把事件放入 MQ 队列，由后台 worker 负责发送，避免为每次发布起 goroutine
-		select {
-		case pub.mqQueue <- event:
-		default:
-			// 队列满时降级为直接异步发送，用信号量限制并发 goroutine 数量
-			select {
-			case pub.fallbackSem <- struct{}{}:
-				go func() {
-					defer func() { <-pub.fallbackSem }()
-					pub.publishToMQ(context.Background(), event)
-				}()
-			default:
-				logError("[发布] MQ队列和降级通道均已满，事件丢弃 topic=%s", topic)
-			}
-		}
-		// 发送到内存总线
+		pub.enqueueMQ(ctx, event)
 		pub.memoryBus.Publish(ctx, event)
 		pub.memoryBus.metrics.IncPublished(topic)
-		logInfo("[发布] 事件已入队MQ并发布到内存总线, topic=%s, eventId=%s", topic, event.Id)
+		logInfo("event enqueued to MQ and published to memory bus: topic=%s eventId=%s", topic, event.Id)
 
 	case ScopeMQOnly:
 		if pub.amqpPub == nil {
-
-			return fmt.Errorf("[发布] 未配置 AMQP 发布者，无法仅发布到 MQ")
+			return fmt.Errorf("AMQP publisher not configured, cannot publish MQ-only event: topic=%s", topic)
 		}
 		event.Source = "amqp"
-		select {
-		case pub.mqQueue <- event:
-		default:
-			// 队列满时降级，用信号量限制并发 goroutine 数量
-			select {
-			case pub.fallbackSem <- struct{}{}:
-				go func() {
-					defer func() { <-pub.fallbackSem }()
-					pub.publishToMQ(context.Background(), event)
-				}()
-			default:
-				logError("[Publish] MQ 队列满且降级通道也满，丢弃事件 topic=%s", topic)
-			}
-		}
+		pub.enqueueMQ(ctx, event)
+		pub.memoryBus.metrics.IncPublished(topic)
 
 	default:
-		err = fmt.Errorf("未知的发布作用域: %v", options.Scope)
+		err = fmt.Errorf("unknown publish scope: %v", options.Scope)
 	}
 
 	return err
+}
+
+// enqueueMQ 将事件放入 MQ 队列；队列满时降级为受信号量限制的直接异步发送。
+//
+// Fix #5: 降级 goroutine 通过 pub.wg.Add(1) 纳入 WaitGroup 统一追踪，
+// 确保 Close() 调用 pub.wg.Wait() 时能等待所有降级 goroutine 完成，
+// 防止 amqpPub 关闭后降级 goroutine 继续写入而引发 panic 或数据竞争。
+func (pub *EventPublisher) enqueueMQ(ctx context.Context, event *Event) {
+	select {
+	case pub.mqQueue <- event:
+		return
+	default:
+	}
+
+	// 队列满，尝试降级：用信号量限制最大并发降级 goroutine 数
+	select {
+	case pub.fallbackSem <- struct{}{}:
+		pub.wg.Add(1) // Fix #5: 纳入 wg，Close 等待此 goroutine 退出
+		go func() {
+			defer pub.wg.Done()
+			defer func() { <-pub.fallbackSem }()
+			pub.publishToMQ(ctx, event)
+		}()
+	default:
+		logError("MQ queue and fallback channel both full, event dropped: topic=%s", event.Topic)
+	}
 }
 
 func (pub *EventPublisher) publishToMQ(ctx context.Context, event *Event) error {
@@ -144,9 +150,9 @@ func (pub *EventPublisher) publishToMQ(ctx context.Context, event *Event) error 
 	err := pub.amqpPub.Publish(ctx, event.Topic, event.Id, msg)
 	pub.memoryBus.metrics.IncMQPublished(event.Topic, err == nil)
 	if err != nil {
-		logError("[发布] 发送到 MQ 失败, topic=%s, error=%v", event.Topic, err)
+		logError("failed to publish to MQ: topic=%s error=%v", event.Topic, err)
 	} else {
-		logInfo("[发布] 事件已发送到 MQ, topic=%s, eventId=%s", event.Topic, event.Id)
+		logInfo("event published to MQ: topic=%s eventId=%s", event.Topic, event.Id)
 	}
 	return err
 }
@@ -157,18 +163,21 @@ func (pub *EventPublisher) startMQWorker() {
 		if ev == nil {
 			continue
 		}
-		// 使用背景上下文，不应阻塞主业务流程
 		if err := pub.publishToMQ(context.Background(), ev); err != nil {
-			logError("[MQWorker] 发布失败: %v", err)
+			logError("MQ worker publish failed: %v", err)
 		}
 	}
 }
 
-// Close 关闭 mqQueue 并等待后台 worker 退出。
+// Close 关闭 mqQueue 并等待后台 mqWorker 及所有降级 goroutine 全部退出。
+//
+// Fix #5: 原实现仅等待 mqWorker（wg 只有 1 个计数），降级 goroutine 不在其中，
+// 可能在 amqpPub 关闭后仍在运行。现在所有降级 goroutine 均通过 wg.Add(1) 注册，
+// wg.Wait() 保证全部退出后才返回。
 func (pub *EventPublisher) Close() error {
 	if pub.mqQueue != nil {
 		close(pub.mqQueue)
-		pub.wg.Wait()
+		pub.wg.Wait() // 等待 mqWorker + 所有降级 goroutine
 	}
 	return nil
 }

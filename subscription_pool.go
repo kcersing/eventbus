@@ -3,7 +3,6 @@ package eventbus
 import (
 	"context"
 	"sync"
-
 )
 
 // poolSubscription SubscribeWithPool 返回的订阅实现。
@@ -20,13 +19,14 @@ type poolSubscription struct {
 
 func (s *poolSubscription) Unsubscribe() {
 	s.once.Do(func() {
-		s.cancel()                      // 停止转发goroutine
-		s.wg.Wait()                     // 等待转发goroutine退出
-		s.pool.Stop()                   // 停止消费者池
-		s.eb.Unsubscribe(s.topic, s.ch) // 从EventBus中移除通道
+		s.cancel()                         // 停止转发 goroutine
+		s.wg.Wait()                        // 等待转发 goroutine 退出
+		s.pool.Stop()                      // 停止消费者池（cancel + 等待 worker 退出）
+		// Fix #10: 调用私有方法 removeChannel，不再依赖 Deprecated 的公开 Unsubscribe。
+		s.eb.removeChannel(s.topic, s.ch) // 从 EventBus 中移除通道
 		close(s.ch)
 		s.eb.untrackSub(s)
-		logInfo("[取消订阅] 消费者池订阅已取消, topic=%s", s.topic)
+		logInfo("pool subscription cancelled: topic=%s", s.topic)
 	})
 }
 
@@ -48,19 +48,19 @@ func (eb *EventBus) SubscribeWithPool(ctx context.Context, topic string, handler
 		cancel: cancel,
 	}
 
-	// 启动一个转发goroutine，将事件从EventBus的通道转发到消费者池
+	// 启动转发 goroutine，将事件从 EventBus 的通道转发到消费者池
 	sub.wg.Add(1)
 	go func() {
 		defer sub.wg.Done()
 		defer func() {
-			logInfo("转发协程已停止, topic=%s", topic)
+			logInfo("forwarder goroutine stopped: topic=%s", topic)
 		}()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case event, ok := <-ch:
-				if !ok { // 通道被关闭
+				if !ok {
 					return
 				}
 				pool.Consume(event)
