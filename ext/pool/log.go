@@ -1,10 +1,13 @@
-package eventbus
+package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 )
+
+var errQueueFull = errors.New("pool: queue full")
 
 func logInfo(format string, args ...any) {
 	if slog.Default().Enabled(context.Background(), slog.LevelInfo) {

@@ -1,10 +1,13 @@
-package eventbus
+package amqp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 )
+
+var errNoAMQP = errors.New("amqp: publisher not configured")
 
 func logInfo(format string, args ...any) {
 	if slog.Default().Enabled(context.Background(), slog.LevelInfo) {

@@ -2,7 +2,5 @@ package eventbus
 
 import "errors"
 
-var (
-	// ErrQueueFull 表示消费者池的队列已满
-	ErrQueueFull = errors.New("consumer pool queue is full")
-)
+// ErrChannelFull 表示订阅者通道已满，事件被丢弃。
+var ErrChannelFull = errors.New("eventbus: subscriber channel full")
