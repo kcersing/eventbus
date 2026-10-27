@@ -77,7 +77,8 @@ func (eb *EventBus) PublishTopic(ctx context.Context, topic string, payload any)
 
 // Subscribe 返回原始事件通道，由调用方自行管理消费 goroutine。
 //
-// ⚠️  此方法返回的通道不被总线追踪，Close() 时会被强制关闭。
+// 与 SubscribeAsync 不同，此方法不追踪订阅生命周期 —— ctx 取消时不会自动清理，
+// 调用方需自行协调 goroutine 退出和通道关闭。总线 Close() 时会强制关闭所有残留通道。
 // 推荐使用 SubscribeAsync 以获得完整的生命周期管理。
 func (eb *EventBus) Subscribe(ctx context.Context, topic string) EventChan {
 	ch := make(EventChan, 64)
@@ -165,7 +166,7 @@ func (eb *EventBus) Close() error {
 }
 
 // ── 内部方法 ────────────────────────────────────────────────────────────────
-
+// dispatch
 func (eb *EventBus) dispatch(ctx context.Context, event *Event) error {
 	eb.mu.RLock()
 
