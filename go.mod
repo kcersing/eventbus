@@ -1,4 +1,4 @@
-module eventbus
+module github.com/kcersing/eventbus
 
 go 1.26.2
 
