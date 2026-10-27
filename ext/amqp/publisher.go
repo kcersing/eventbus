@@ -7,11 +7,12 @@ package amqp
 
 import (
 	"context"
-	"eventbus"
 	"sync"
 	"time"
 
-	"eventbus/ext/amqp/amqpclt"
+	"github.com/kcersing/eventbus"
+
+	"github.com/kcersing/eventbus/ext/amqp/amqpclt"
 )
 
 // Listener 监听 RabbitMQ，将消息转换为 Event 后发布到本地 EventBus。

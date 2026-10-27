@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"sync"
 
-	"eventbus"
+	"github.com/kcersing/eventbus"
 
-	"eventbus/ext/pool"
+	"github.com/kcersing/eventbus/ext/pool"
 )
 
 // ConsumerConfig 绑定一个 Handler 到指定 topic 和池参数。

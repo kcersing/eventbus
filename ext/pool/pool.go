@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"eventbus"
+	"github.com/kcersing/eventbus"
 )
 
 // Options 消费者池配置。

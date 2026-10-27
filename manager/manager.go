@@ -8,9 +8,9 @@ import (
 	"context"
 	"errors"
 
-	"eventbus"
+	"github.com/kcersing/eventbus"
 
-	extamqp "eventbus/ext/amqp"
+	extamqp "github.com/kcersing/eventbus/ext/amqp"
 )
 
 // Manager 统一管理所有事件组件的生命周期。
