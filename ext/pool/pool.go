@@ -30,6 +30,8 @@ type Options struct {
 	MaxRetries int
 	// RetryBackoff 重试基础间隔，指数退避，默认 1s。
 	RetryBackoff time.Duration
+	// RetryClassifier 决定失败后的处理策略；nil 时使用 eventbus.DefaultRetryClassifier。
+	RetryClassifier eventbus.RetryClassifier
 	// FailHandler 入队失败（队列满/已关闭）时的回调。
 	FailHandler func(event *eventbus.Event, err error)
 	// DeadLetterFunc 重试耗尽时的死信回调（如落盘、告警）。
@@ -43,6 +45,9 @@ func WithQueueSize(n int) Option                { return func(o *Options) { o.Qu
 func WithHandlerTimeout(d time.Duration) Option { return func(o *Options) { o.HandlerTimeout = d } }
 func WithMaxRetries(n int) Option               { return func(o *Options) { o.MaxRetries = n } }
 func WithRetryBackoff(d time.Duration) Option   { return func(o *Options) { o.RetryBackoff = d } }
+func WithRetryClassifier(fn eventbus.RetryClassifier) Option {
+	return func(o *Options) { o.RetryClassifier = fn }
+}
 func WithFailHandler(fn func(*eventbus.Event, error)) Option {
 	return func(o *Options) { o.FailHandler = fn }
 }
@@ -61,14 +66,16 @@ type ConsumerPool struct {
 	wg      sync.WaitGroup
 }
 
-func newPool(name string, handler eventbus.Handler, workerNum int, opts Options) *ConsumerPool {
-	ctx, cancel := context.WithCancel(context.Background())
+// newPool 创建消费者池。ctx 是池的生命周期根：其取消会立即停止所有 worker，
+// 其 Value/Deadline 也会传递给 Handler 的 ctx。
+func newPool(ctx context.Context, name string, handler eventbus.Handler, workerNum int, opts Options) *ConsumerPool {
+	poolCtx, cancel := context.WithCancel(ctx)
 	cp := &ConsumerPool{
 		name:    name,
 		handler: handler,
 		queue:   make(chan *eventbus.Event, opts.QueueSize),
 		opts:    opts,
-		ctx:     ctx,
+		ctx:     poolCtx,
 		cancel:  cancel,
 	}
 	for range workerNum {
@@ -118,6 +125,20 @@ func (cp *ConsumerPool) process(event *eventbus.Event) {
 			return
 		}
 
+		classifier := cp.opts.RetryClassifier
+		if classifier == nil {
+			classifier = eventbus.DefaultRetryClassifier
+		}
+		switch classifier(cp.ctx, event, err) {
+		case eventbus.DeadLetter:
+			logWarn("pool: classifier=dead_letter: pool=%s topic=%s error=%v", cp.name, event.Topic, err)
+			cp.deadLetter(event)
+			return
+		case eventbus.Drop:
+			logWarn("pool: classifier=drop: pool=%s topic=%s error=%v", cp.name, event.Topic, err)
+			return
+		}
+
 		if attempt == cp.opts.MaxRetries {
 			logError("pool: retries exhausted: pool=%s topic=%s retries=%d error=%v",
 				cp.name, event.Topic, cp.opts.MaxRetries, err)
@@ -161,6 +182,11 @@ func (cp *ConsumerPool) deadLetter(event *eventbus.Event) {
 // SubscribeWithPool 使用消费者池订阅事件，返回可取消的 Subscription。
 //
 // workerNum 控制并发 worker 数量；通过 Option 可配置重试、超时、死信等行为。
+//
+// 生命周期：父 ctx 取消、Unsubscribe、总线 Close 三者任一发生都会停止 worker、
+// 移除订阅并关闭内部通道；Unsubscribe 可重复调用。父 ctx 的 Value/Deadline 会
+// 传递给 Handler。注意：停止时队列中尚未处理的事件会被丢弃；Handler 内不要同步
+// 调用 Unsubscribe（会等待自身退出而阻塞）。
 func SubscribeWithPool(
 	ctx context.Context,
 	bus *eventbus.EventBus,
@@ -180,9 +206,9 @@ func SubscribeWithPool(
 		opt(&o)
 	}
 
-	cp := newPool(topic, handler, workerNum, o)
+	cp := newPool(ctx, topic, handler, workerNum, o)
 	ch := bus.Subscribe(ctx, topic)
-	ctx, cancel := context.WithCancel(ctx)
+	fwdCtx, cancel := context.WithCancel(ctx)
 
 	sub := &poolSub{
 		bus:    bus,
@@ -195,9 +221,12 @@ func SubscribeWithPool(
 	sub.wg.Add(1)
 	go func() {
 		defer sub.wg.Done()
+		// 统一收敛：父 ctx 取消、总线关闭（ch 被关闭）、主动 Unsubscribe 都会走到这里，
+		// 避免任一退出路径留下 worker 泄漏。
+		defer sub.teardown()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-fwdCtx.Done():
 				return
 			case event, ok := <-ch:
 				if !ok {
@@ -220,14 +249,24 @@ type poolSub struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	once   sync.Once
+	closed sync.Once
 }
 
+// Unsubscribe 取消订阅并释放资源，可重复调用。
 func (s *poolSub) Unsubscribe() {
 	s.once.Do(func() {
-		s.cancel()    // 停止转发 goroutine
-		s.wg.Wait()   // 等待转发 goroutine 退出
-		s.pool.stop() // 等待所有 worker 退出
-		s.bus.RemoveChannel(s.topic, s.ch)
+		s.cancel()   // 停止转发 goroutine
+		s.wg.Wait()  // 等待转发 goroutine 退出（其 defer 会执行 teardown）
+		s.teardown() // 兜底：确保资源在任何退出路径下都被释放
+	})
+}
+
+// teardown 释放订阅资源。转发 goroutine 与 Unsubscribe 都可能触发它，
+// 通过 sync.Once 保证只执行一次；不等待转发 goroutine，避免自等待死锁。
+func (s *poolSub) teardown() {
+	s.closed.Do(func() {
+		s.bus.RemoveChannel(s.topic, s.ch) // 先停止新事件投递
+		s.pool.stop()                      // 等待所有 worker 退出
 		closeEventChan(s.ch)
 		logInfo("pool: unsubscribed: topic=%s", s.topic)
 	})

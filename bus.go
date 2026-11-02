@@ -2,10 +2,11 @@ package eventbus
 
 import (
 	"context"
-	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // EventChan 是订阅者接收事件的通道类型。
@@ -17,15 +18,25 @@ type Subscription interface {
 	Unsubscribe()
 }
 
-// wildcardEntry 将同一通配符 pattern 的所有订阅通道归组管理。
+// subscription 是内部订阅记录，id 用于投递回执标识订阅方。
+type subscription struct {
+	id    string
+	topic string
+	ch    EventChan
+}
+
+// wildcardEntry 将同一通配符 pattern 的所有订阅归组管理。
+// segments 是 pattern 按 '.' 拆分后的缓存，供匹配时避免重复 Split。
 type wildcardEntry struct {
 	pattern  string
-	channels []EventChan
+	segments []string
+	subs     []*subscription
 }
 
 // EventBus 内存事件总线。
 //
-//   - 支持精确主题订阅和通配符订阅（* 匹配单层，语义同 path.Match）
+//   - 支持精确主题订阅和通配符订阅：按 '.' 分段，'*' 匹配一个段，
+//     段内支持 '?' 与 '[]'（语义同 path.Match）
 //   - 支持中间件链（Use）
 //   - 线程安全
 //
@@ -37,18 +48,19 @@ type wildcardEntry struct {
 //	bus.Publish(ctx, eventbus.NewEvent("order.created", payload))
 type EventBus struct {
 	mu           sync.RWMutex
-	subscribers  map[string][]EventChan
+	subscribers  map[string][]*subscription
 	wildcardSubs []wildcardEntry
 	middlewares  []Middleware
 	chain        atomic.Value // stores Handler，原子读写消除 Publish/Use 竞争
 	activeSubs   []Subscription
 	subsMu       sync.Mutex
+	subSeq       atomic.Uint64
 }
 
 // New 创建事件总线。
 func New() *EventBus {
 	eb := &EventBus{
-		subscribers: make(map[string][]EventChan),
+		subscribers: make(map[string][]*subscription),
 	}
 	eb.storeChain(HandlerFunc(eb.dispatch))
 	return eb
@@ -73,6 +85,22 @@ func (eb *EventBus) Publish(ctx context.Context, event *Event) {
 // PublishTopic 按主题发布事件的便捷方法，内部自动构造 Event。
 func (eb *EventBus) PublishTopic(ctx context.Context, topic string, payload any) {
 	eb.Publish(ctx, NewEvent(topic, payload))
+}
+
+// PublishReport 发布事件并返回每个匹配订阅的投递回执。
+//
+// 与 Publish 的区别：
+//   - 返回每个订阅者的投递结果（queued / dropped）；
+//   - 中间件返回错误时不分发，并返回该错误与已产生的回执；
+//   - 回执只代表“写入订阅者通道成功”，不代表 Handler 处理完成。
+//
+// AMQP Listener 使用此方法在记录回执后再 Ack。中间件必须透传 ctx，否则回执
+// 收集器会丢失。
+func (eb *EventBus) PublishReport(ctx context.Context, event *Event) ([]DeliveryReceipt, error) {
+	collector := &receiptCollector{}
+	handler := eb.chain.Load().(Handler)
+	err := handler.Handle(context.WithValue(ctx, receiptCollectorKey{}, collector), event)
+	return collector.receipts, err
 }
 
 // Subscribe 返回原始事件通道，由调用方自行管理消费 goroutine。
@@ -150,15 +178,15 @@ func (eb *EventBus) Close() error {
 	defer eb.mu.Unlock()
 
 	// 关闭残留（通过 Subscribe 直接获取的）通道
-	for topic, chs := range eb.subscribers {
-		for _, ch := range chs {
-			closeSafe(ch)
+	for topic, subs := range eb.subscribers {
+		for _, sub := range subs {
+			closeSafe(sub.ch)
 		}
 		delete(eb.subscribers, topic)
 	}
 	for _, entry := range eb.wildcardSubs {
-		for _, ch := range entry.channels {
-			closeSafe(ch)
+		for _, sub := range entry.subs {
+			closeSafe(sub.ch)
 		}
 	}
 	eb.wildcardSubs = nil
@@ -168,6 +196,8 @@ func (eb *EventBus) Close() error {
 // ── 内部方法 ────────────────────────────────────────────────────────────────
 // dispatch
 func (eb *EventBus) dispatch(ctx context.Context, event *Event) error {
+	collector := receiptCollectorFromContext(ctx)
+
 	eb.mu.RLock()
 
 	exact := eb.subscribers[event.Topic]
@@ -176,35 +206,56 @@ func (eb *EventBus) dispatch(ctx context.Context, event *Event) error {
 		return nil
 	}
 
-	// 快速路径：单一精确订阅者，无通配符
-	if len(exact) == 1 && len(eb.wildcardSubs) == 0 {
-		ch := exact[0]
-		eb.mu.RUnlock()
-		sendSafe(ch, event)
-		return nil
-	}
-
-	// 统计通配符命中的真实 channel 数，精确分配切片
-	var matched [][]EventChan
-	extraLen := 0
-	for i := range eb.wildcardSubs {
-		if ok, _ := path.Match(eb.wildcardSubs[i].pattern, event.Topic); ok {
-			matched = append(matched, eb.wildcardSubs[i].channels)
-			extraLen += len(eb.wildcardSubs[i].channels)
+	// 统计通配符命中的真实订阅，顺带判断是否存在匹配。
+	var wildcardHits []*subscription
+	if len(eb.wildcardSubs) > 0 {
+		topicSegments := strings.Split(event.Topic, ".")
+		for i := range eb.wildcardSubs {
+			if matchSegments(eb.wildcardSubs[i].segments, topicSegments) {
+				wildcardHits = append(wildcardHits, eb.wildcardSubs[i].subs...)
+			}
 		}
 	}
 
-	all := make([]EventChan, len(exact), len(exact)+extraLen)
-	copy(all, exact)
-	for _, chs := range matched {
-		all = append(all, chs...)
+	// 快速路径：单一精确订阅者且无通配符命中。
+	if len(exact) == 1 && len(wildcardHits) == 0 {
+		sub := exact[0]
+		eb.mu.RUnlock()
+		eb.deliver(collector, sub, event)
+		return nil
 	}
+
+	// 复制一份目标列表，避免解锁后被 RemoveChannel 修改底层切片。
+	targets := make([]*subscription, 0, len(exact)+len(wildcardHits))
+	targets = append(targets, exact...)
+	targets = append(targets, wildcardHits...)
 	eb.mu.RUnlock()
 
-	for _, ch := range all {
-		sendSafe(ch, event)
+	for _, sub := range targets {
+		eb.deliver(collector, sub, event)
 	}
 	return nil
+}
+
+// deliver 向单个订阅发送事件，并在需要时记录投递回执。
+func (eb *EventBus) deliver(collector *receiptCollector, sub *subscription, event *Event) {
+	ok := sendSafe(sub.ch, event)
+	if collector == nil {
+		return
+	}
+
+	status := DeliveryQueued
+	if !ok {
+		status = DeliveryDropped
+	}
+	collector.add(DeliveryReceipt{
+		EventID:           event.Id,
+		Topic:             event.Topic,
+		SubscriberID:      sub.id,
+		SubscriptionTopic: sub.topic,
+		Status:            status,
+		At:                time.Now(),
+	})
 }
 
 func (eb *EventBus) rebuildChain() {
@@ -221,16 +272,26 @@ func (eb *EventBus) storeChain(h Handler) {
 
 // addChannel 将 ch 注册到订阅表（调用方须持有写锁）。
 func (eb *EventBus) addChannel(topic string, ch EventChan) {
-	if strings.Contains(topic, "*") {
+	sub := &subscription{
+		id:    "sub-" + strconv.FormatUint(eb.subSeq.Add(1), 10),
+		topic: topic,
+		ch:    ch,
+	}
+	if isWildcardPattern(topic) {
+		segments := strings.Split(topic, ".")
 		for i := range eb.wildcardSubs {
 			if eb.wildcardSubs[i].pattern == topic {
-				eb.wildcardSubs[i].channels = append(eb.wildcardSubs[i].channels, ch)
+				eb.wildcardSubs[i].subs = append(eb.wildcardSubs[i].subs, sub)
 				return
 			}
 		}
-		eb.wildcardSubs = append(eb.wildcardSubs, wildcardEntry{pattern: topic, channels: []EventChan{ch}})
+		eb.wildcardSubs = append(eb.wildcardSubs, wildcardEntry{
+			pattern:  topic,
+			segments: segments,
+			subs:     []*subscription{sub},
+		})
 	} else {
-		eb.subscribers[topic] = append(eb.subscribers[topic], ch)
+		eb.subscribers[topic] = append(eb.subscribers[topic], sub)
 	}
 }
 
@@ -245,17 +306,17 @@ func (eb *EventBus) removeChannel(topic string, ch EventChan) {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
 
-	if strings.Contains(topic, "*") {
+	if isWildcardPattern(topic) {
 		for i, entry := range eb.wildcardSubs {
 			if entry.pattern != topic {
 				continue
 			}
-			for j, c := range entry.channels {
-				if c != ch {
+			for j, sub := range entry.subs {
+				if sub.ch != ch {
 					continue
 				}
-				eb.wildcardSubs[i].channels = append(entry.channels[:j], entry.channels[j+1:]...)
-				if len(eb.wildcardSubs[i].channels) == 0 {
+				eb.wildcardSubs[i].subs = append(entry.subs[:j], entry.subs[j+1:]...)
+				if len(eb.wildcardSubs[i].subs) == 0 {
 					eb.wildcardSubs = append(eb.wildcardSubs[:i], eb.wildcardSubs[i+1:]...)
 				}
 				return
@@ -264,10 +325,10 @@ func (eb *EventBus) removeChannel(topic string, ch EventChan) {
 		return
 	}
 
-	chs := eb.subscribers[topic]
-	for i, c := range chs {
-		if c == ch {
-			eb.subscribers[topic] = append(chs[:i], chs[i+1:]...)
+	subs := eb.subscribers[topic]
+	for i, sub := range subs {
+		if sub.ch == ch {
+			eb.subscribers[topic] = append(subs[:i], subs[i+1:]...)
 			return
 		}
 	}
@@ -292,13 +353,19 @@ func (eb *EventBus) untrackSub(s Subscription) {
 
 // ── 辅助函数 ────────────────────────────────────────────────────────────────
 
-// sendSafe 向通道发送事件；通道满时丢弃并记日志。
-func sendSafe(ch EventChan, event *Event) {
-	defer func() { recover() }()
+// sendSafe 向通道发送事件；通道满或已关闭时返回 false 并记日志。
+func sendSafe(ch EventChan, event *Event) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
 	select {
 	case ch <- event:
+		return true
 	default:
 		logWarn("eventbus: channel full, event dropped: topic=%s", event.Topic)
+		return false
 	}
 }
 

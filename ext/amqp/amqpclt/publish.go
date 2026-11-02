@@ -14,11 +14,11 @@ var _ Publisher = (*Publish)(nil)
 
 // Publish 实现 AMQP 发布者，内置 Publisher Confirms 和指数退避重试。
 type Publish struct {
-	ch           *amqp.Channel
-	exchange     string
-	log          func(context.Context, ...any)
-	maxRetries   int
-	retryBackoff time.Duration
+	ch             *amqp.Channel
+	exchange       string
+	maxRetries     int
+	retryBackoff   time.Duration
+	confirmTimeout time.Duration // 0 表示只受调用方 ctx 限制
 }
 
 // PublishOption 发布者配置项。
@@ -32,6 +32,11 @@ func WithMaxRetries(n int) PublishOption {
 // WithRetryBackoff 设置重试基础退避间隔，默认 100ms，指数增长。
 func WithRetryBackoff(d time.Duration) PublishOption {
 	return func(p *Publish) { p.retryBackoff = d }
+}
+
+// WithPublishTimeout 设置等待 Broker Confirm 的单次超时，0 表示不额外限制。
+func WithPublishTimeout(d time.Duration) PublishOption {
+	return func(p *Publish) { p.confirmTimeout = d }
 }
 
 // NewPublisher 创建 AMQP 发布者并启用 Publisher Confirms 模式。
@@ -65,6 +70,10 @@ func NewPublisher(conn *amqp.Connection, exchange string, opts ...PublishOption)
 func (p *Publish) Publish(ctx context.Context, routingKey, correlationId string, m Message) error {
 	if m.PayloadType == "" {
 		m.PayloadType = reflect.TypeOf(m.Payload).String()
+	}
+	// 同时写入消息体，保证接收端解码后仍能拿到 correlationId。
+	if m.CorrelationId == "" {
+		m.CorrelationId = correlationId
 	}
 
 	body, err := sonic.Marshal(&m)
@@ -101,7 +110,7 @@ func (p *Publish) publishWithRetry(ctx context.Context, routingKey string, msg a
 			continue
 		}
 
-		acked, err := dc.WaitContext(ctx)
+		acked, err := p.waitForConfirm(ctx, dc)
 		if err != nil {
 			return err
 		}
@@ -126,6 +135,16 @@ func (p *Publish) backoff(attempt int) time.Duration {
 		attempt = 10
 	}
 	return p.retryBackoff * (1 << attempt)
+}
+
+// waitForConfirm 等待 Broker 确认；配置了 confirmTimeout 时叠加超时。
+func (p *Publish) waitForConfirm(ctx context.Context, dc *amqp.DeferredConfirmation) (bool, error) {
+	if p.confirmTimeout <= 0 {
+		return dc.WaitContext(ctx)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, p.confirmTimeout)
+	defer cancel()
+	return dc.WaitContext(waitCtx)
 }
 
 // Close 关闭底层 AMQP 通道。
@@ -154,7 +173,7 @@ func (p *Publish) PublishBatch(ctx context.Context, messages []BatchMessage) ([]
 	var failedIndices []int
 	for i, bm := range messages {
 		if err := p.Publish(ctx, bm.RoutingKey, bm.CorrelationId, bm.Message); err != nil {
-			p.log(ctx, fmt.Sprintf("batch message %d: %v", i, err))
+			logWarn(ctx, "batch message %d: %v", i, err)
 			failedIndices = append(failedIndices, i)
 		}
 	}
@@ -188,7 +207,7 @@ func (p *Publish) PublishAsync(ctx context.Context, messages []BatchMessage, res
 
 			err := p.Publish(ctx, bm.RoutingKey, bm.CorrelationId, bm.Message)
 			if err != nil {
-				p.log(ctx, fmt.Sprintf("async message %d: %v", i, err))
+				logWarn(ctx, "async message %d: %v", i, err)
 			}
 			resultCh <- PublishResult{Index: i, Error: err}
 		}
