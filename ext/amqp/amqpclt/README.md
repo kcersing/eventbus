@@ -3,7 +3,7 @@
 
 |   步骤        |代码位置                        | 作用                                 |
 |1. 创建        |NewPublisher                    |建立 RabbitMQ 连接与交换机            |
-|2. 获取接收者  |getRecipients                  |确定要发给谁（10 个用户）             |
+|2. 获取接收者  |getRecipients                  |确定要发给谁          |
 |3. 准备消息    |prepareBatchMessages            |为每个接收者构建 BatchMessage，包含路由键、关联 ID、消息体|
 |4. 异步发布    |PublishAsync                    |后台 goroutine 逐条发送，结果通过通道返回|
 |5. 收集结果	|for result := range resultCh   |汇总成功/失败统计，支持重试逻辑|

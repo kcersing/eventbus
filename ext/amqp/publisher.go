@@ -146,8 +146,11 @@ func (l *Listener) handle(ctx context.Context, delivery *amqpclt.Delivery) {
 	logInfo("amqp listener: delivered: topic=%s id=%s subscribers=%d", event.Topic, event.Id, len(receipts))
 }
 
-// Stop 停止监听，等待内部 goroutine 退出。
+// Stop 停止监听，等待内部 goroutine 退出。未调用 Start 或重复调用时安全返回。
 func (l *Listener) Stop() {
+	if l.cancel == nil {
+		return
+	}
 	l.cancel()
 	<-l.done
 }

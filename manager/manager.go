@@ -13,10 +13,17 @@ import (
 	extamqp "github.com/kcersing/eventbus/ext/amqp"
 )
 
+// Lifecycle 是 Manager 依赖的最小组件生命周期能力。
+// ext/amqp.Listener 实现了该接口；测试也可以注入自定义实现。
+type Lifecycle interface {
+	Start(ctx context.Context) error
+	Stop()
+}
+
 // Manager 统一管理所有事件组件的生命周期。
 type Manager struct {
 	Bus       *eventbus.EventBus
-	Listener  *extamqp.Listener  // 可选，MQ → 内存总线
+	Listener  Lifecycle          // 可选，MQ → 内存总线
 	Publisher *extamqp.Publisher // 可选，统一发布入口
 	Registry  *Registry          // 可选，消费者注册表
 }
@@ -24,7 +31,7 @@ type Manager struct {
 // New 创建 Manager，所有字段均为可选（nil 表示不启用）。
 func New(
 	bus *eventbus.EventBus,
-	listener *extamqp.Listener,
+	listener Lifecycle,
 	publisher *extamqp.Publisher,
 	registry *Registry,
 ) *Manager {

@@ -68,7 +68,8 @@ func NewPublisher(conn *amqp.Connection, exchange string, opts ...PublishOption)
 // Publish 发布消息到 Broker，等待 Broker 确认（Publisher Confirm）。
 // 失败时指数退避重试 maxRetries 次。
 func (p *Publish) Publish(ctx context.Context, routingKey, correlationId string, m Message) error {
-	if m.PayloadType == "" {
+	// reflect.TypeOf(nil) 返回 nil，直接调用 String() 会 panic，需先判空。
+	if m.PayloadType == "" && m.Payload != nil {
 		m.PayloadType = reflect.TypeOf(m.Payload).String()
 	}
 	// 同时写入消息体，保证接收端解码后仍能拿到 correlationId。
